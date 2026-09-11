@@ -37,10 +37,10 @@ B 不会收到本地处理的对话、项目系统提示词、本地文件结果
 
 本仓库采用 DSH 官方 bundle 结构：`package.json` 声明 `dsh.bundle`，`cordis.patch.yml` 负责挂载 Host 插件。源码是可直接运行的 JavaScript，不需要安装时构建。
 
-从 GitHub 固定版本安装：
+从 GitHub 安装：
 
 ```sh
-dsh plugin --profile web add github:LYiHub/pub-dsh-privacy-router#v0.1.0
+dsh plugin --profile web add github:LYiHub/pub-dsh-privacy-router
 dsh --profile web
 ```
 
