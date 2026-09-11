@@ -19,6 +19,12 @@
 - 同一用户 Turn 内的工具续步和 Provider 重试复用第一次判定。
 - 云端回复直接进入当前 Assistant 消息，不使用 subagent，也不经过本地模型二次转写。
 
+## 配套项目
+
+本插件与 [Local AI Discovery Server](https://github.com/LYiHub/pub-local-ai-discovery-server) 配套使用。发现服务运行在提供本地推理的主机上，通过 mDNS / DNS-SD 广播 OpenAI-compatible API 的主机、端口、基础路径、模型列表路径和认证要求；DSH 侧的本地发现集成将其注册为 `local-ai-*` Provider，本插件再将该 Provider 作为受信任的本地 A 路由。
+
+Local AI Discovery Server 只负责 `_local-ai._tcp.local.` 服务广播，不负责模型推理或 API 代理。本仓库也不包含 mDNS 发现客户端，需要由 DSH 的本地 Provider 集成消费该广播。
+
 ## 云端数据边界
 
 B 在官方 DSH 的默认配置下只能收到：
