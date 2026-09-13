@@ -364,6 +364,240 @@ test('records classifier output and terminal failure details', async t => {
   }
 })
 
+test('classifier results require a protocol-consistent terminal state', async t => {
+  const completeArgs = (value = { classification: 'public', reason: 'safe' }) => JSON.stringify(value)
+  const chunksFor = (args, finishKind) => {
+    const chunks = [
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      {
+        type: 'tool-call-delta',
+        index: 0,
+        id: 'classification',
+        name: 'structured_output',
+        argumentsDelta: args,
+      },
+      {
+        type: 'block-end',
+        index: 0,
+        block: { type: 'tool-call', id: 'classification', name: 'structured_output', arguments: args },
+      },
+    ]
+    return finishKind === undefined
+      ? chunks
+      : [...chunks, { type: 'finish', reason: { kind: finishKind } }]
+  }
+
+  const cases = [
+    {
+      name: 'missing finish',
+      args: completeArgs(),
+      finishKind: undefined,
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'stop finish',
+      args: completeArgs(),
+      finishKind: 'stop',
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'unknown finish',
+      args: completeArgs(),
+      finishKind: 'unexpected',
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'tool-calls with trailing junk',
+      args: `${completeArgs()} trailing junk`,
+      finishKind: 'tool-calls',
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'tool-calls with additional field',
+      args: completeArgs({ classification: 'public', reason: 'safe', extra: true }),
+      finishKind: 'tool-calls',
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'tool-calls with invalid classification',
+      args: completeArgs({ classification: 'Public', reason: 'safe' }),
+      finishKind: 'tool-calls',
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'tool-calls with empty reason',
+      args: completeArgs({ classification: 'public', reason: '   ' }),
+      finishKind: 'tool-calls',
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'tool-calls with array payload',
+      args: JSON.stringify([{ classification: 'public', reason: 'safe' }]),
+      finishKind: 'tool-calls',
+      reason: 'classifier-unknown',
+    },
+    {
+      name: 'max-tokens with complete JSON',
+      args: completeArgs(),
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+    {
+      name: 'max-tokens with complete JSON and trailing junk',
+      args: `${completeArgs()} trailing junk`,
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+    {
+      name: 'max-tokens with closed reason and object suffix',
+      args: '{"classification":"public","reason":"safe"}',
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+    {
+      name: 'max-tokens with closed reason and another field',
+      args: '{"classification":"public","reason":"safe","extra":true',
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+    {
+      name: 'max-tokens with raw control character',
+      args: '{"classification":"public","reason":"bad\u0000',
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+    {
+      name: 'max-tokens with dangling escape',
+      args: '{"classification":"public","reason":"safe\\',
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+    {
+      name: 'max-tokens with incomplete unicode escape',
+      args: '{"classification":"public","reason":"safe\\u12',
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+    {
+      name: 'max-tokens truncated in another field',
+      args: '{"classification":"public","other":"safe',
+      finishKind: 'max-tokens',
+      reason: 'classifier-max-tokens',
+    },
+  ]
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const fixture = context('unknown', {
+        classifierChunks: chunksFor(item.args, item.finishKind),
+      })
+      const currentAgent = agent()
+      const result = await routeTurn(fixture, currentAgent, [userMessage('Ambiguous request')])
+
+      assert.deepEqual(result.route, LOCAL_ROUTE)
+      assert.equal(fixture.requests.length, 1)
+      assert.equal(fixture.originalCalls(), 1)
+      assert.equal(currentAgent.events[1].data.classification, 'unknown')
+      assert.equal(currentAgent.events[1].data.reason, item.reason)
+      assert.equal(currentAgent.events[1].data.classifier.finish, item.finishKind ?? 'missing')
+    })
+  }
+})
+
+test('classifier rejects multiple or unexpected tool calls after tool-calls finish', async t => {
+  const validArgs = JSON.stringify({ classification: 'public', reason: 'safe' })
+  const toolCallChunks = (name, index = 0) => [
+    { type: 'block-start', index, blockType: 'tool-call' },
+    {
+      type: 'tool-call-delta',
+      index,
+      id: `call-${index}`,
+      name,
+      argumentsDelta: validArgs,
+    },
+    {
+      type: 'block-end',
+      index,
+      block: { type: 'tool-call', id: `call-${index}`, name, arguments: validArgs },
+    },
+  ]
+
+  const cases = [
+    {
+      name: 'duplicate structured output calls',
+      chunks: [
+        ...toolCallChunks('structured_output', 0),
+        ...toolCallChunks('structured_output', 1),
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ],
+    },
+    {
+      name: 'unexpected extra tool call',
+      chunks: [
+        ...toolCallChunks('structured_output', 0),
+        ...toolCallChunks('read_file', 1),
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ],
+    },
+  ]
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const fixture = context('unknown', { classifierChunks: item.chunks })
+      const currentAgent = agent()
+      const result = await routeTurn(fixture, currentAgent, [userMessage('Ambiguous request')])
+
+      assert.deepEqual(result.route, LOCAL_ROUTE)
+      assert.equal(currentAgent.events[1].data.classification, 'unknown')
+      assert.equal(currentAgent.events[1].data.reason, 'classifier-unknown')
+      assert.equal(fixture.originalCalls(), 1)
+    })
+  }
+})
+
+test('classifier rejects repeated finishes or chunks after a terminal finish', async t => {
+  const validCall = classifierChunks('public', 'safe').filter(chunk => chunk.type !== 'finish')
+  const lateToolCall = {
+    type: 'tool-call-delta',
+    index: 0,
+    id: 'classification',
+    name: 'structured_output',
+    argumentsDelta: '',
+  }
+  const cases = [
+    {
+      name: 'error finish followed by tool-calls finish',
+      chunks: [
+        ...validCall,
+        { type: 'finish', reason: { kind: 'error', failure: { code: 'EARLIER', message: 'failed' } } },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ],
+    },
+    {
+      name: 'tool-calls finish followed by another tool call chunk',
+      chunks: [
+        ...validCall,
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+        lateToolCall,
+      ],
+    },
+  ]
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const fixture = context('unknown', { classifierChunks: item.chunks })
+      const currentAgent = agent()
+      const result = await routeTurn(fixture, currentAgent, [userMessage('Ambiguous request')])
+
+      assert.deepEqual(result.route, LOCAL_ROUTE)
+      assert.equal(currentAgent.events[1].data.classification, 'unknown')
+      assert.equal(currentAgent.events[1].data.reason, 'classifier-unknown')
+      assert.equal(currentAgent.events[1].data.classifier.finish, 'invalid-protocol')
+      assert.equal(fixture.originalCalls(), 1)
+    })
+  }
+})
+
 test('recovers a complete classification when max tokens truncates only the reason', async () => {
   const fixture = context('unknown', {
     classifierChunks: [

@@ -308,43 +308,62 @@ function classifierPrompt(config, candidate) {
   ].join('\n')
 }
 
-function truncatedJsonString(fragment) {
-  let encoded = ''
-  let escaped = false
-  for (const character of fragment) {
-    if (!escaped && character === '"') break
-    encoded += character
-    escaped = !escaped && character === '\\'
-  }
-  if (escaped) encoded = encoded.slice(0, -1)
+const CLASSIFIER_VALUES = ['public', 'sensitive', 'unknown']
+const JSON_WHITESPACE = '[ \\t\\n\\r]*'
+const TRUNCATED_REASON_PATTERN = new RegExp(
+  `^${JSON_WHITESPACE}\\{${JSON_WHITESPACE}"classification"${JSON_WHITESPACE}:${JSON_WHITESPACE}"`
+    + `(public|sensitive|unknown)"${JSON_WHITESPACE},${JSON_WHITESPACE}"reason"`
+    + `${JSON_WHITESPACE}:${JSON_WHITESPACE}"([\\s\\S]*)$`,
+)
+
+function parseCompleteClassifierResult(argumentsValue) {
+  if (typeof argumentsValue !== 'string') return { classification: 'unknown' }
+  let value
   try {
-    return JSON.parse(`"${encoded}"`)
+    value = JSON.parse(argumentsValue)
   } catch {
-    return encoded
+    return { classification: 'unknown' }
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { classification: 'unknown' }
+  }
+  const keys = Object.keys(value)
+  if (keys.length !== 2 || !keys.includes('classification') || !keys.includes('reason')) {
+    return { classification: 'unknown' }
+  }
+  if (!CLASSIFIER_VALUES.includes(value.classification) || typeof value.reason !== 'string') {
+    return { classification: 'unknown' }
+  }
+  const reason = value.reason.trim()
+  return reason.length === 0
+    ? { classification: 'unknown' }
+    : { classification: value.classification, reason }
+}
+
+function decodeTruncatedReason(fragment) {
+  try {
+    const decoded = JSON.parse(`"${fragment}"`)
+    if (typeof decoded !== 'string') return undefined
+    const normalized = decoded.trim()
+    return normalized.length === 0 ? undefined : normalized
+  } catch {
+    return undefined
   }
 }
 
-function parseClassifierResult(argumentsValue, allowPartial) {
-  try {
-    const value = JSON.parse(argumentsValue)
-    if (['public', 'sensitive', 'unknown'].includes(value?.classification)
-      && typeof value.reason === 'string'
-      && value.reason.trim().length > 0) {
-      return { classification: value.classification, reason: value.reason.trim() }
-    }
-  } catch {
-    // A max-token response may contain a complete first field and a truncated reason.
-  }
-  if (allowPartial) {
-    const partial = /^\s*\{\s*"classification"\s*:\s*"(public|sensitive|unknown)"\s*,\s*"reason"\s*:\s*"([\s\S]*)$/.exec(argumentsValue)
-    if (partial !== null) {
-      return {
-        classification: partial[1],
-        reason: truncatedJsonString(partial[2]).trim(),
-        reasonTruncated: true,
-      }
-    }
-  }
+function parseTruncatedClassifierResult(argumentsValue) {
+  if (typeof argumentsValue !== 'string') return { classification: 'unknown' }
+  const match = TRUNCATED_REASON_PATTERN.exec(argumentsValue)
+  if (match === null) return { classification: 'unknown' }
+  const reason = decodeTruncatedReason(match[2])
+  return reason === undefined
+    ? { classification: 'unknown' }
+    : { classification: match[1], reason, reasonTruncated: true }
+}
+
+function parseClassifierResult(argumentsValue, finishKind) {
+  if (finishKind === 'tool-calls') return parseCompleteClassifierResult(argumentsValue)
+  if (finishKind === 'max-tokens') return parseTruncatedClassifierResult(argumentsValue)
   return { classification: 'unknown' }
 }
 
@@ -378,7 +397,13 @@ async function classifyLocally(ctx, config, candidate, route, signal, internalRe
 
   const blocks = new Map()
   let finish
+  let terminalSeen = false
+  let protocolInvalid = false
   for await (const chunk of ctx.llm.stream(request)) {
+    if (terminalSeen) {
+      protocolInvalid = true
+      continue
+    }
     if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') {
       const type = chunk.type === 'text-delta' ? 'text' : 'reasoning'
       const block = blocks.get(chunk.index) ?? { type, text: '' }
@@ -400,26 +425,27 @@ async function classifyLocally(ctx, config, candidate, route, signal, internalRe
         blocks.set(chunk.index, { type: chunk.block.type, text: chunk.block.text })
       }
     } else if (chunk.type === 'finish') {
+      terminalSeen = true
       finish = chunk.reason
     }
   }
 
-  const structured = [...blocks.values()].find(block =>
-    block.type === 'tool-call' && block.name === CLASSIFIER_TOOL.name)
+  const finishKind = protocolInvalid ? 'invalid-protocol' : finish?.kind ?? 'missing'
+  const toolCalls = [...blocks.values()].filter(block => block.type === 'tool-call')
+  const structured = toolCalls.length === 1 && toolCalls[0].name === CLASSIFIER_TOOL.name
+    ? toolCalls[0]
+    : undefined
   const result = structured === undefined
     ? { classification: 'unknown' }
-    : parseClassifierResult(structured.text, finish?.kind === 'max-tokens')
+    : parseClassifierResult(structured.text, finishKind)
   const classifier = {
-    finish: finish?.kind ?? 'missing',
+    finish: finishKind,
     output: renderClassifierOutput(blocks),
     ...(result.reason === undefined ? {} : { reason: result.reason }),
     ...(result.reasonTruncated === true ? { reasonTruncated: true } : {}),
     ...(finish?.failure === undefined
       ? {}
       : { error: `${finish.failure.code}: ${finish.failure.message}` }),
-  }
-  if (finish?.kind === 'error' || finish?.kind === 'aborted') {
-    return { classification: 'unknown', classifier }
   }
   return {
     classification: result.classification,
