@@ -149,14 +149,14 @@ function cloudRequests(fixture) {
   return fixture.requests.filter(request => request.provider === CLOUD_ROUTE.provider)
 }
 
-function agent(history = [], seedEvents = []) {
+function agent(history = [], seedEvents = [], sessionId = 'session-1') {
   const events = []
   const sessionEvents = [...seedEvents]
   return {
     id: 'agent-1',
     options: LOCAL_ROUTE,
     session: {
-      id: 'session-1',
+      id: sessionId,
       append(type, data) {
         events.push({ type, data })
         sessionEvents.push({ type, data })
@@ -1470,4 +1470,118 @@ test('a queued cloud dispatch requires the approved message in the streamed payl
   assert.equal(cloudRequests(fixture).length, 0)
   assert.equal(fixture.originalCalls(), 0)
   assert.equal(result.chunks.at(-1).reason.failure.code, 'PRIVACY_ROUTER_STALE_DISPATCH')
+})
+
+test('a once-value grant never leaves a reusable sanitized copy behind', async () => {
+  let asks = 0
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    userQuestions: { ask: async () => {
+      asks += 1
+      return authorizationAnswer('允许，仅本次具体值')
+    } },
+  })
+  const phoneUser = userMessage('联系 13800000000', 'once-cached-phone')
+  const history = [phoneUser]
+  const currentAgent = agent(history)
+
+  await routeTurn(fixture, currentAgent, [phoneUser], history, {}, 1)
+  assert.equal(asks, 1)
+  assert.match(cloudRequests(fixture)[0].messages[0].content[0].text, /\[PHONE_REDACTED_1\]/)
+
+  // A later session-category grant naming the same message must still not resurrect the
+  // copy that was only ever authorized for one specific value in one specific turn.
+  currentAgent.session.append('privacy-router/check-result', {
+    turn: 2,
+    decision: 'cloud',
+    approvedMessageIds: [phoneUser.id],
+    placeholderCount: 1,
+    eligibleEntities: [{ type: 'phone', count: 1 }],
+    authorization: {
+      ok: true,
+      scope: 'session-category',
+      types: ['phone'],
+      authorizedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    },
+  })
+
+  const next = userMessage('请继续解释公开概念。', 'once-cached-next')
+  history.push(next)
+  await routeTurn(fixture, currentAgent, [next], history, {}, 3)
+
+  const secondCloudRequest = cloudRequests(fixture).at(-1)
+  assert.deepEqual(secondCloudRequest.messages, [next])
+  assert.doesNotMatch(JSON.stringify(secondCloudRequest), /13800000000|PHONE_REDACTED/)
+})
+
+test('the per-session sanitized message cache is bounded', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    userQuestions: { ask: async () => authorizationAnswer('本会话记住这些实体类别') },
+  })
+  const history = []
+  const currentAgent = agent(history)
+  const limit = 128
+  const total = limit + 2
+
+  for (let index = 0; index < total; index += 1) {
+    const message = userMessage('联系 13800000000', `bounded-phone-${index}`)
+    history.push(message)
+    await routeTurn(fixture, currentAgent, [message], history, {}, index + 1)
+  }
+
+  const next = userMessage('请继续解释公开概念。', 'bounded-next')
+  history.push(next)
+  await routeTurn(fixture, currentAgent, [next], history, {}, total + 1)
+
+  const sentIds = cloudRequests(fixture).at(-1).messages.map(message => String(message.id))
+  const retained = sentIds.filter(id => id.startsWith('bounded-phone-'))
+  assert.equal(retained.length, limit)
+  assert.equal(retained.includes('bounded-phone-0'), false)
+  assert.equal(retained.includes('bounded-phone-1'), false)
+  assert.equal(retained.includes('bounded-phone-2'), true)
+  assert.equal(retained.includes(`bounded-phone-${total - 1}`), true)
+  assert.equal(sentIds.at(-1), 'bounded-next')
+  assert.doesNotMatch(JSON.stringify(cloudRequests(fixture).at(-1)), /13800000000/)
+})
+
+async function auxiliaryChunks(fixture, sessionId) {
+  const chunks = []
+  for await (const chunk of fixture.stream({
+    provider: CLOUD_ROUTE.provider,
+    model: CLOUD_ROUTE.model,
+    purpose: 'session-title',
+    sessionId,
+    messages: [userMessage('Summarize this session.')],
+  }, fixture.original)) chunks.push(chunk)
+  return chunks
+}
+
+test('tracked session state is bounded and evicted sessions fail closed', async () => {
+  const fixture = context('public', { nerChunks: nerChunks([]) })
+  const sessionIds = []
+  const total = 33
+
+  for (let index = 0; index < total; index += 1) {
+    const sessionId = `bounded-session-${index}`
+    sessionIds.push(sessionId)
+    const message = userMessage('Compare HTTP/2 and HTTP/3.', `${sessionId}-message`)
+    await routeTurn(fixture, agent([], [], sessionId), [message])
+  }
+
+  const before = fixture.requests.length
+  const evicted = await auxiliaryChunks(fixture, sessionIds[0])
+  assert.equal(evicted.at(-1).reason.kind, 'error')
+  assert.equal(evicted.at(-1).reason.failure.code, 'PRIVACY_ROUTER_AUXILIARY_CLOUD_BLOCKED')
+  // Blocked outright, so the request never reached any provider at all.
+  assert.equal(fixture.requests.length, before)
+
+  const retained = await auxiliaryChunks(fixture, sessionIds.at(-1))
+  assert.notEqual(retained.at(-1).reason.kind, 'error')
+  assert.equal(fixture.requests.length, before + 1)
+  const forcedRequest = fixture.requests.at(-1)
+  assert.equal(forcedRequest.provider, LOCAL_ROUTE.provider)
+  assert.equal(forcedRequest.model, LOCAL_ROUTE.model)
+  assert.equal(forcedRequest.purpose, 'session-title')
 })

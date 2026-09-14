@@ -46,6 +46,8 @@ const NER_ENTITY_TYPES = new Set(['person', 'org', 'address', 'job_title', 'proj
 const NER_ORG_SCOPES = new Set(['public', 'internal', 'customer', 'supplier'])
 const SESSION_AUTH_TTL_MS = 12 * 60 * 60 * 1000
 const CLOUD_DISPATCH_MAX_AGE_MS = 2 * 60 * 1000
+const MAX_TRACKED_SESSIONS = 32
+const MAX_SANITIZED_MESSAGES_PER_SESSION = 128
 const AUTHORIZATION_SALT = randomBytes(16).toString('hex')
 
 const ENTITY_LABELS = {
@@ -1285,12 +1287,43 @@ export function apply(ctx, inputConfig) {
     if (config.recordSessionEvents) session.append(type, data)
   }
 
+  // Fail-safe bound: every session-keyed Map is capped so a long-lived DSH process cannot
+  // grow without limit. Eviction only ever drops an optimization or a cached decision, and
+  // every consumer treats a missing entry as "stay local" (cloudDispatches ->
+  // PRIVACY_ROUTER_UNTRUSTED_MAIN_PROVIDER, trustedRoutesBySession ->
+  // PRIVACY_ROUTER_AUXILIARY_CLOUD_BLOCKED, sessionAuthorizations -> ask the user again),
+  // so bounding this state can never widen cloud access.
+  const evictOldestKeys = (map, limit) => {
+    for (const key of map.keys()) {
+      if (map.size <= limit) break
+      map.delete(key)
+    }
+  }
+
+  // delete+set refreshes insertion order, so the least recently written key evicts first.
+  const rememberSessionKey = (map, key, value) => {
+    map.delete(key)
+    map.set(key, value)
+    evictOldestKeys(map, MAX_TRACKED_SESSIONS)
+  }
+
+  const rememberSanitizedMessages = (sessionId, messages) => {
+    const sanitizedById = sanitizedCloudMessagesBySession.get(sessionId) ?? new Map()
+    for (const message of messages) {
+      const messageId = String(message.id)
+      sanitizedById.delete(messageId)
+      sanitizedById.set(messageId, message)
+    }
+    evictOldestKeys(sanitizedById, MAX_SANITIZED_MESSAGES_PER_SESSION)
+    rememberSessionKey(sanitizedCloudMessagesBySession, sessionId, sanitizedById)
+  }
+
   const rememberLocalRoute = (agent, candidate) => {
     if (isTrustedRoute(candidate, config)) {
       const route = callConfig(candidate)
       localRoutes.set(agent, route)
       if (agent?.session?.id !== undefined && agent.session.id !== null) {
-        trustedRoutesBySession.set(String(agent.session.id), route)
+        rememberSessionKey(trustedRoutesBySession, String(agent.session.id), route)
       }
       return route
     }
@@ -1321,7 +1354,7 @@ export function apply(ctx, inputConfig) {
     }
     if (state === undefined && create) {
       state = { categories: new Map() }
-      sessionAuthorizations.set(key, state)
+      rememberSessionKey(sessionAuthorizations, key, state)
     }
     return state
   }
@@ -1481,7 +1514,7 @@ export function apply(ctx, inputConfig) {
     if (prior?.turn === payload.turn) {
       const sessionId = String(payload.agent.session.id)
       if (prior.useCloud && prior.candidate !== undefined) {
-        cloudDispatches.set(sessionId, {
+        rememberSessionKey(cloudDispatches, sessionId, {
           candidate: prior.candidate,
           checkId: prior.checkId,
           authorization: prior.authorization,
@@ -1662,14 +1695,14 @@ export function apply(ctx, inputConfig) {
           }
         }
         if (classification === 'public') {
-          const sessionIdForMessages = String(payload.agent.session.id)
-          let sanitizedById = sanitizedCloudMessagesBySession.get(sessionIdForMessages)
-          if (sanitizedById === undefined) {
-            sanitizedById = new Map()
-            sanitizedCloudMessagesBySession.set(sessionIdForMessages, sanitizedById)
-          }
-          for (const message of sanitizedMessages) {
-            sanitizedById.set(String(message.id), message)
+          // A one-time value grant is deliberately never reusable by a later turn, so its
+          // sanitized copy is not cached at all. Caching it would only retain a redacted
+          // message that approvedCloudMessageGrants() would refuse to hand back anyway.
+          if (authorization?.scope !== 'once-value') {
+            rememberSanitizedMessages(
+              String(payload.agent.session.id),
+              sanitizedMessages,
+            )
           }
           const cloudAuthorization = combineCloudAuthorization(authorization, candidate.historyAuthorization)
           cloudCandidate = {
@@ -1743,7 +1776,7 @@ export function apply(ctx, inputConfig) {
 
     const sessionId = String(payload.agent.session.id)
     if (useCloud && candidate !== undefined) {
-      cloudDispatches.set(sessionId, {
+      rememberSessionKey(cloudDispatches, sessionId, {
         candidate: cloudCandidate,
         checkId,
         authorization: cloudAuthorization,
