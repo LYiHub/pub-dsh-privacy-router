@@ -13,6 +13,8 @@
     "index.js",
     "cordis.patch.yml",
     "README.md",
+    "CONTEXT.md",
+    "docs/",
     "LICENSE"
   ],
   "scripts": {
