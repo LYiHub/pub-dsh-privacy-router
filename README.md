@@ -108,12 +108,40 @@ Provider ID 必须完整匹配 `trustedProviders`，或匹配 `trustedProviderPr
 
 修改 profile patch 后重启 DSH。配置层会整体替换该行的 `config`；未写字段使用插件默认值。
 
+## 路由模式
+
+插件支持两种模式，由 `routingMode` 选择：
+
+- `privacy-gated-cloud`（默认）：主 Agent 始终挂在受信任本地 Provider 上，隐私判定为 `public` 的轮次自动升级到云端，其余全部本地。这是本插件一直以来的行为。
+- `user-choice`：尊重用户在 DSH 模型选择器里的选择。此时必须同时配置 `localProvider`/`localModel`（必须在受信任列表内），用于 NER、隐私分类，以及强制回落。
+
+`user-choice` 下的行为矩阵：
+
+| 用户选择 | 本轮判定 | 实际执行 |
+| --- | --- | --- |
+| 云端 | `public` | 走云端 |
+| 云端 | 仅含手机号/邮箱 | 弹授权卡，占位后上云；拒绝则本地 |
+| 云端 | 身份证/银行卡/密钥/本地路径/自定义词/人名/精确地址/内部单位等硬拦截，或 `sensitive`/`unknown` | 强制切回 `localProvider` 完成 |
+| 本地 | `public` | 走本地；本地在首个正文 token 之前不响应时，自动占位复扫后降级云端（留 `privacy-router/local-fallback` 审计事件） |
+| 本地 | 仅含手机号/邮箱 | 先走本地；只有本地故障触发降级时才弹授权卡，拒绝则报错留本地 |
+| 本地 | 硬拦截/`sensitive`/`unknown` | 走本地；本地同时故障时直接报错，**绝不**上云 |
+
+本地故障降级有三条硬边界：
+
+1. 只有已经完整通过隐私判定、拿到“休眠云端凭证”的 `public` 轮次才可能降级；敏感轮次不持有凭证，本地故障只会报错。
+2. 只在首个正文（或推理）token 之前的故障生效：连接错误、首个分块失败、错误终止、首 token 超时。一旦本地开始吐字，之后中断会原样抛出，不会把两个模型的回答拼接给用户。
+3. 降级激活时会重新走一遍全部云端闸门：凭证与锚点消息校验、手机号/邮箱授权（含过期检查）、最终载荷复扫。任何一关不过都留在错误侧。
+
+注意：NER 和分类器本身运行在本地模型上。请求开始时本地服务已彻底不可用意味着无法完成隐私判定，此时不会降级云端。自动降级覆盖的是“小模型检查仍可用、主生成调用故障”的窗口。
+
 ## 配置
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
+| `routingMode` | `privacy-gated-cloud` | 路由模式：`privacy-gated-cloud` 或 `user-choice` |
 | `cloudProvider` | `deepseek-official` | 云端 Provider ID |
 | `cloudModel` | `deepseek-v4-flash` | 云端模型 ID |
+| `localProvider` / `localModel` | 未设置 | `user-choice` 模式必填的本地落点；必须匹配受信任 Provider 白名单 |
 | `trustedProviders` | `[]` | 完整的本地 Provider ID 白名单 |
 | `trustedProviderPrefixes` | `["local-ai-"]` | 本地 Provider ID 前缀白名单 |
 | `privacyPolicy` | 内置策略 | 交给本地分类器的隐私定义 |
@@ -129,6 +157,8 @@ Provider ID 必须完整匹配 `trustedProviders`，或匹配 `trustedProviderPr
 | `nerMaxTokens` | `512` | 本地 NER 输出上限 |
 | `authorizationTtlMs` | `43200000` | 会话类别授权的内存 TTL（12 小时）；授权只存进程内存，重启 DSH 后失效 |
 | `cloudMaxTokens` | `8192` | 云端回复输出上限 |
+| `localFailureCloudFallback` | `true` | `user-choice` 下本地偏好的 public 轮次，本地故障时是否允许降级云端 |
+| `localFailureTimeoutMs` | `45000` | 首 token 等待上限（毫秒）；0 表示只认连接级错误，不按超时降级 |
 | `recordSessionEvents` | `false` | 内部兼容开关；仅供能够识别 `privacy-router/*` 事件的定制 Harness 使用 |
 
 `PRIVACY_ROUTER_CLOUD_PROVIDER` 和 `PRIVACY_ROUTER_CLOUD_MODEL` 可在 shell 或 `$DSH_HOME/.env` 中覆盖 bundle 默认值。

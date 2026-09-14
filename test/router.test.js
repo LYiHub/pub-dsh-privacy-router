@@ -172,7 +172,19 @@ function agent(history = [], seedEvents = [], sessionId = 'session-1') {
   }
 }
 
+function cloudAgent(history = [], seedEvents = [], sessionId = 'session-1') {
+  const selected = agent(history, seedEvents, sessionId)
+  selected.options = CLOUD_ROUTE
+  selected.session.requestHeader = () => ({ config: CLOUD_ROUTE })
+  return selected
+}
+
 async function routeTurn(fixture, currentAgent, messages, fullHistory = messages, streamOptions = {}, turn = 1) {
+  const {
+    nextRoute = LOCAL_ROUTE,
+    original: originalGenerator = fixture.original,
+    ...rawStreamOptions
+  } = streamOptions
   await fixture.preStep({
     agent: currentAgent,
     messages,
@@ -186,7 +198,7 @@ async function routeTurn(fixture, currentAgent, messages, fullHistory = messages
     turn,
     step: 1,
     signal: new AbortController().signal,
-  }, async () => LOCAL_ROUTE)
+  }, async () => nextRoute)
 
   const chunks = []
   for await (const chunk of fixture.stream({
@@ -195,8 +207,8 @@ async function routeTurn(fixture, currentAgent, messages, fullHistory = messages
     system: 'private cwd: /Users/example/private-project',
     tools: [{ name: 'read_file', description: 'Read local files', parameters: {} }],
     sessionId: currentAgent.session.id,
-    ...streamOptions,
-  }, fixture.original)) chunks.push(chunk)
+    ...rawStreamOptions,
+  }, originalGenerator)) chunks.push(chunk)
 
   return { route, chunks }
 }
@@ -1584,4 +1596,560 @@ test('tracked session state is bounded and evicted sessions fail closed', async 
   assert.equal(forcedRequest.provider, LOCAL_ROUTE.provider)
   assert.equal(forcedRequest.model, LOCAL_ROUTE.model)
   assert.equal(forcedRequest.purpose, 'session-title')
+})
+
+const USER_CHOICE_CONFIG = {
+  routingMode: 'user-choice',
+  localProvider: LOCAL_ROUTE.provider,
+  localModel: LOCAL_ROUTE.model,
+  localFailureTimeoutMs: 30,
+}
+
+function failingNext(code = 'ECONNREFUSED', message = 'local connection refused') {
+  return async () => {
+    throw Object.assign(new Error(message), { code })
+  }
+}
+
+function rejectingStreamNext(code = 'ECONNRESET', message = 'local first chunk failed') {
+  const failure = () => Promise.reject(Object.assign(new Error(message), { code }))
+  return async () => ({
+    [Symbol.asyncIterator]() {
+      return this
+    },
+    next: failure,
+  })
+}
+
+async function* errorFinishStream() {
+  yield {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: { code: 'LOCAL_UPSTREAM_ERROR', message: 'local model process exited' },
+    },
+  }
+}
+
+async function* silentLocalStream() {
+  await new Promise(() => {})
+}
+
+async function* partialThenThrowStream() {
+  yield { type: 'block-start', index: 0, blockType: 'text' }
+  yield { type: 'text-delta', index: 0, text: 'local partial answer' }
+  throw new Error('connection reset mid-stream')
+}
+
+async function* trickleThenHangStream() {
+  // Non-content chunks must not extend the single first-token deadline.
+  yield { type: 'block-start', index: 0, blockType: 'reasoning' }
+  await new Promise(resolve => setTimeout(resolve, 20))
+  yield { type: 'reasoning-start', index: 0 }
+  await new Promise(resolve => setTimeout(resolve, 20))
+  yield { type: 'block-start', index: 1, blockType: 'text' }
+  await new Promise(() => {})
+}
+
+async function consumeFailingTurn(fixture, currentAgent, message, original, turn = 1) {
+  await fixture.preStep({
+    agent: currentAgent,
+    messages: [message],
+    turn,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => undefined)
+  const route = await fixture.request({
+    agent: currentAgent,
+    turn,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => LOCAL_ROUTE)
+  const chunks = []
+  let thrown
+  try {
+    for await (const chunk of fixture.stream({
+      ...route,
+      messages: [message],
+      system: 'public system note',
+      tools: [],
+      sessionId: currentAgent.session.id,
+    }, original)) chunks.push(chunk)
+  } catch (error) {
+    thrown = error
+  }
+  return { route, chunks, thrown }
+}
+
+test('user-choice config requires a trusted local landing', () => {
+  assert.throws(
+    () => resolveConfig({ routingMode: 'user-choice' }),
+    /requires localProvider and localModel/,
+  )
+  assert.throws(
+    () => resolveConfig({
+      routingMode: 'user-choice',
+      localProvider: 'untrusted-cloud',
+      localModel: 'some-model',
+    }),
+    /match trustedProviders/,
+  )
+  assert.doesNotThrow(() => resolveConfig(USER_CHOICE_CONFIG))
+  assert.doesNotThrow(() => resolveConfig())
+})
+
+test('user-choice honors a selected cloud model for public turns', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Compare HTTP/2 and HTTP/3.', 'choice-public')
+  const result = await routeTurn(fixture, cloudAgent(), [current], [current], {
+    nextRoute: CLOUD_ROUTE,
+  })
+
+  assert.deepEqual(result.route, { ...CLOUD_ROUTE, maxTokens: 8_192 })
+  assert.equal(cloudRequests(fixture).length, 1)
+  const checkResult = fixture.requests.length && result
+  assert.equal(checkResult.route.provider, CLOUD_ROUTE.provider)
+})
+
+test('user-choice forces a cloud-selected sensitive turn back to local', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('检查 /Users/example/secret/config.ts 的内容', 'choice-sensitive')
+  const currentAgent = cloudAgent()
+  const result = await routeTurn(fixture, currentAgent, [current], [current], {
+    nextRoute: CLOUD_ROUTE,
+  })
+
+  assert.deepEqual(result.route, LOCAL_ROUTE)
+  assert.equal(cloudRequests(fixture).length, 0)
+  assert.equal(result.chunks.some(chunk => chunk.text === 'local answer'), true)
+  const event = currentAgent.events[1].data
+  assert.equal(event.userPreference, 'cloud')
+  assert.equal(event.decision, 'local')
+  assert.equal(event.reason, 'local-path')
+})
+
+test('user-choice never falls back to cloud when a cloud-selected sensitive turn fails locally', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('检查 /Users/example/secret/config.ts 的内容', 'choice-sensitive-fail')
+  const currentAgent = cloudAgent()
+  const { thrown } = await consumeFailingTurn(
+    fixture,
+    currentAgent,
+    current,
+    rejectingStreamNext(),
+  )
+
+  assert.equal(thrown instanceof Error, true)
+  assert.equal(cloudRequests(fixture).length, 0)
+})
+
+test('local preference falls back to cloud on a local transport error for a public turn', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Compare HTTP/2 and HTTP/3.', 'fallback-transport')
+  const currentAgent = agent()
+  const result = await routeTurn(fixture, currentAgent, [current], [current], {
+    original: failingNext(),
+  })
+
+  assert.deepEqual(result.route, LOCAL_ROUTE)
+  const cloudRequest = cloudRequests(fixture)[0]
+  assert.equal(cloudRequest !== undefined, true)
+  assert.deepEqual(cloudRequest.messages.map(message => message.id), [current.id])
+  assert.equal(result.chunks.some(chunk => chunk.text === 'cloud answer'), true)
+  const fallbackEvent = currentAgent.events.find(
+    event => event.type === 'privacy-router/local-fallback',
+  )
+  assert.equal(fallbackEvent.data.reason, 'ECONNREFUSED')
+  assert.equal(fallbackEvent.data.fallback, 'cloud')
+  const decisionEvent = currentAgent.events[1].data
+  assert.equal(decisionEvent.userPreference, 'local')
+  assert.equal(decisionEvent.localFailureCloudFallback, 'ready')
+})
+
+test('local preference falls back to cloud on an error finish before any content', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Explain QUIC handshake.', 'fallback-error-finish')
+  const result = await routeTurn(fixture, agent(), [current], [current], {
+    original: errorFinishStream,
+  })
+
+  assert.equal(cloudRequests(fixture).length, 1)
+  assert.equal(result.chunks.some(chunk => chunk.text === 'cloud answer'), true)
+  const fallbackEvent = result.chunks
+  assert.equal(fallbackEvent.length > 0, true)
+})
+
+test('local preference falls back to cloud on a first-token timeout', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Explain TLS 1.3.', 'fallback-timeout')
+  const result = await routeTurn(fixture, agent(), [current], [current], {
+    original: silentLocalStream,
+  })
+
+  assert.equal(cloudRequests(fixture).length, 1)
+  assert.equal(result.chunks.some(chunk => chunk.text === 'cloud answer'), true)
+})
+
+test('local preference does not switch to cloud after local content has started', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Explain WebRTC.', 'fallback-midstream')
+  const { chunks, thrown } = await consumeFailingTurn(
+    fixture,
+    agent(),
+    current,
+    partialThenThrowStream,
+  )
+
+  assert.equal(thrown instanceof Error, true)
+  assert.equal(chunks.some(chunk => chunk.text === 'local partial answer'), true)
+  assert.equal(cloudRequests(fixture).length, 0)
+})
+
+test('local preference keeps a hard-blocked turn local even when local generation fails', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('读取 /Users/example/secret/key.pem', 'fallback-hard-block')
+  const { chunks, thrown } = await consumeFailingTurn(
+    fixture,
+    agent(),
+    current,
+    rejectingStreamNext(),
+  )
+
+  assert.equal(thrown instanceof Error, true)
+  assert.equal(chunks.length, 0)
+  assert.equal(cloudRequests(fixture).length, 0)
+})
+
+test('local failure with a phone asks for placeholder authorization at failure time', async () => {
+  let asks = 0
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+    userQuestions: {
+      ask: async () => {
+        asks += 1
+        return authorizationAnswer('拒绝，留在本地')
+      },
+    },
+  })
+  const current = userMessage('联系 13800000000', 'fallback-phone-deny')
+  const { chunks } = await consumeFailingTurn(fixture, agent(), current, failingNext())
+
+  assert.equal(asks, 1)
+  assert.equal(cloudRequests(fixture).length, 0)
+  assert.equal(chunks.at(-1).reason.kind, 'error')
+  assert.equal(
+    chunks.at(-1).reason.failure.code,
+    'PRIVACY_ROUTER_FALLBACK_AUTHORIZATION_DENIED',
+  )
+})
+
+test('local failure with a phone can placehold and use the cloud after a one-time grant', async () => {
+  let asks = 0
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+    userQuestions: {
+      ask: async () => {
+        asks += 1
+        return authorizationAnswer('允许，仅本次具体值')
+      },
+    },
+  })
+  const current = userMessage('联系 13800000000', 'fallback-phone-allow')
+  const currentAgent = agent()
+  const result = await routeTurn(fixture, currentAgent, [current], [current], {
+    original: failingNext(),
+  })
+
+  assert.equal(asks, 1)
+  assert.equal(result.chunks.some(chunk => chunk.text === 'cloud answer'), true)
+  const cloudRequest = cloudRequests(fixture)[0]
+  assert.match(cloudRequest.messages[0].content[0].text, /\[PHONE_REDACTED_1\]/)
+  assert.doesNotMatch(JSON.stringify(cloudRequest), /13800000000/)
+  const fallbackGrants = currentAgent.events.filter(
+    event => event.type === 'privacy-router/check-result' && event.data.decision === 'cloud',
+  )
+  assert.equal(fallbackGrants.length, 1)
+  assert.equal(fallbackGrants[0].data.method, 'local-failure-fallback')
+})
+
+test('local failure with a phone can placehold after a session-category grant', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+    userQuestions: {
+      ask: async () => authorizationAnswer('本会话记住这些实体类别'),
+    },
+  })
+  const current = userMessage('联系 13800000000', 'fallback-phone-session')
+  const currentAgent = agent()
+  const result = await routeTurn(fixture, currentAgent, [current], [current], {
+    original: failingNext(),
+  })
+
+  assert.equal(result.chunks.some(chunk => chunk.text === 'cloud answer'), true)
+  const cloudRequest = cloudRequests(fixture)[0]
+  assert.match(cloudRequest.messages[0].content[0].text, /\[PHONE_REDACTED_1\]/)
+  assert.doesNotMatch(JSON.stringify(cloudRequest), /13800000000/)
+  const fallbackDecision = currentAgent.events.find(
+    event => event.type === 'privacy-router/check-result'
+      && event.data.method === 'local-failure-fallback',
+  )
+  assert.equal(fallbackDecision.data.authorization.scope, 'session-category')
+})
+
+test('a dormant fallback voucher cannot be consumed by a cloud request before local fails', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Compare TCP and QUIC.', 'dormant-anchor')
+  const currentAgent = agent()
+  await fixture.preStep({
+    agent: currentAgent,
+    messages: [current],
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => undefined)
+  const route = await fixture.request({
+    agent: currentAgent,
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => LOCAL_ROUTE)
+  assert.deepEqual(route, LOCAL_ROUTE)
+
+  // An unsolicited cloud stream (e.g. another component ignoring local selection) must
+  // not be able to spend the voucher while the local leg is still pending.
+  const chunks = []
+  for await (const chunk of fixture.stream({
+    provider: CLOUD_ROUTE.provider,
+    model: CLOUD_ROUTE.model,
+    messages: [current],
+    system: 'x',
+    tools: [],
+    sessionId: currentAgent.session.id,
+  }, fixture.original)) chunks.push(chunk)
+
+  assert.equal(chunks.at(-1).reason.kind, 'error')
+  assert.equal(
+    chunks.at(-1).reason.failure.code,
+    'PRIVACY_ROUTER_DORMANT_FALLBACK_REJECTED',
+  )
+  assert.equal(cloudRequests(fixture).length, 0)
+})
+
+test('the first-token deadline is a single deadline even when non-content chunks trickle in', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: { ...USER_CHOICE_CONFIG, localFailureTimeoutMs: 60 },
+  })
+  const current = userMessage('Explain gRPC.', 'trickle-anchor')
+  const startedAt = Date.now()
+  const result = await routeTurn(fixture, agent(), [current], [current], {
+    original: trickleThenHangStream,
+  })
+  const elapsed = Date.now() - startedAt
+
+  assert.equal(cloudRequests(fixture).length, 1)
+  assert.equal(result.chunks.some(chunk => chunk.text === 'cloud answer'), true)
+  // Three 20ms-spaced non-content chunks would push a per-next resetting timer past
+  // 100ms; the single deadline must fire near 60ms.
+  assert.equal(elapsed < 300, true, `fallback took ${elapsed}ms`)
+})
+
+test('a user-aborted local request does not trigger the cloud fallback', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Explain MPTCP.', 'aborted-anchor')
+  const currentAgent = agent()
+  await fixture.preStep({
+    agent: currentAgent,
+    messages: [current],
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => undefined)
+  const route = await fixture.request({
+    agent: currentAgent,
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => LOCAL_ROUTE)
+  const aborted = new AbortController()
+  aborted.abort()
+  const chunks = []
+  for await (const chunk of fixture.stream({
+    ...route,
+    messages: [current],
+    system: 'x',
+    tools: [],
+    sessionId: currentAgent.session.id,
+    signal: aborted.signal,
+  }, failingNext())) chunks.push(chunk)
+
+  assert.equal(chunks.length, 0)
+  assert.equal(cloudRequests(fixture).length, 0)
+})
+
+test('user-choice runs NER and classification on the configured landing, not the selected provider', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: {
+      ...USER_CHOICE_CONFIG,
+      localProvider: 'local-ai-configured',
+      localModel: 'configured-local-model',
+    },
+  })
+  const current = userMessage('Compare SCTP and QUIC.', 'configured-landing')
+  const result = await routeTurn(fixture, cloudAgent(), [current], [current], {
+    nextRoute: CLOUD_ROUTE,
+  })
+
+  assert.deepEqual(result.route, { ...CLOUD_ROUTE, maxTokens: 8_192 })
+  const safetyRequests = fixture.requests.filter(
+    request => request.tools?.[0]?.name === 'structured_output'
+      || request.tools?.[0]?.name === 'structured_ner_output',
+  )
+  assert.equal(safetyRequests.length, 2)
+  for (const request of safetyRequests) {
+    assert.equal(request.provider, 'local-ai-configured')
+    assert.equal(request.model, 'configured-local-model')
+  }
+})
+
+test('a stale fallback voucher for a different message runs local without activating the cloud', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const approved = userMessage('Approved question.', 'stale-voucher-approved')
+  const currentAgent = agent()
+  await fixture.preStep({
+    agent: currentAgent,
+    messages: [approved],
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => undefined)
+  await fixture.request({
+    agent: currentAgent,
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => LOCAL_ROUTE)
+
+  const { chunks, thrown } = await consumeFailingTurn(
+    fixture,
+    currentAgent,
+    userMessage('A different message entirely.', 'stale-voucher-other'),
+    rejectingStreamNext(),
+    1,
+  )
+
+  assert.equal(chunks.length, 0)
+  assert.equal(thrown instanceof Error, true)
+  assert.equal(cloudRequests(fixture).length, 0)
+})
+
+test('a voucher consumed by local content cannot be resurrected by a same-turn replay', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Explain UDP.', 'content-started-anchor')
+  const currentAgent = agent()
+
+  // First stream starts delivering local content, which consumes the dormant voucher.
+  const first = await routeTurn(fixture, currentAgent, [current], [current], {
+    original: async function* () {
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text: 'local answer body' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  })
+  assert.equal(first.chunks.some(chunk => chunk.text === 'local answer body'), true)
+
+  // A provider-level retry re-enters agent/request for the same turn. The local stream
+  // now fails; the already-consumed voucher must not activate the cloud.
+  const { chunks, thrown } = await consumeFailingTurn(
+    fixture,
+    currentAgent,
+    current,
+    rejectingStreamNext('ECONNRESET'),
+    1,
+  )
+
+  assert.equal(thrown instanceof Error, true)
+  assert.equal(chunks.length, 0)
+  assert.equal(cloudRequests(fixture).length, 0)
+})
+
+test('concurrent failing local streams can only activate the cloud fallback once', async () => {
+  const fixture = context('public', {
+    nerChunks: nerChunks([]),
+    config: USER_CHOICE_CONFIG,
+  })
+  const current = userMessage('Explain IPsec.', 'concurrent-anchor')
+  const currentAgent = agent()
+  await fixture.preStep({
+    agent: currentAgent,
+    messages: [current],
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => undefined)
+  const route = await fixture.request({
+    agent: currentAgent,
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+  }, async () => LOCAL_ROUTE)
+
+  // Two local streams fail at the same time; only one may claim the single-use voucher.
+  const streamOptions = {
+    ...route,
+    messages: [current],
+    system: 'x',
+    tools: [],
+    sessionId: currentAgent.session.id,
+  }
+  const collect = async () => {
+    const chunks = []
+    for await (const chunk of fixture.stream(streamOptions, failingNext())) chunks.push(chunk)
+    return chunks
+  }
+  const [first, second] = await Promise.all([collect(), collect()])
+
+  const cloudBodies = [...first, ...second].filter(chunk => chunk.text === 'cloud answer')
+  assert.equal(cloudBodies.length, 1)
+  assert.equal(cloudRequests(fixture).length, 1)
 })

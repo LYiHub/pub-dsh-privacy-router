@@ -4,6 +4,9 @@
       config:
         cloudProvider: !!js process.env.PRIVACY_ROUTER_CLOUD_PROVIDER || 'deepseek-official'
         cloudModel: !!js process.env.PRIVACY_ROUTER_CLOUD_MODEL || 'deepseek-v4-flash'
+        routingMode: !!js "process.env.PRIVACY_ROUTER_ROUTING_MODE || undefined"
+        localProvider: !!js "process.env.PRIVACY_ROUTER_LOCAL_PROVIDER || undefined"
+        localModel: !!js "process.env.PRIVACY_ROUTER_LOCAL_MODEL || undefined"
         trustedProviderPrefixes:
           - local-ai-
         sensitiveTerms: !!js "process.env.PRIVACY_ROUTER_SENSITIVE_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_SENSITIVE_TERMS_JSON) : undefined"
@@ -17,6 +20,8 @@
         nerConfidenceThreshold: !!js Number(process.env.PRIVACY_ROUTER_NER_CONFIDENCE_THRESHOLD || '0.85')
         nerMaxTokens: !!js Number(process.env.PRIVACY_ROUTER_NER_MAX_TOKENS || '512')
         authorizationTtlMs: !!js Number(process.env.PRIVACY_ROUTER_AUTHORIZATION_TTL_MS || '43200000')
+        localFailureCloudFallback: !!js "process.env.PRIVACY_ROUTER_LOCAL_FAILURE_CLOUD_FALLBACK === '0' ? false : undefined"
+        localFailureTimeoutMs: !!js Number(process.env.PRIVACY_ROUTER_LOCAL_FAILURE_TIMEOUT_MS || '45000')
         privacyPolicy: >-
           Treat identity cards, bank cards, credentials, secrets, local paths,
           names, precise addresses, unpublished source code, internal project details,

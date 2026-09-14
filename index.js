@@ -46,6 +46,10 @@ const NER_ENTITY_TYPES = new Set(['person', 'org', 'address', 'job_title', 'proj
 const NER_ORG_SCOPES = new Set(['public', 'internal', 'customer', 'supplier'])
 const SESSION_AUTH_TTL_MS = 12 * 60 * 60 * 1000
 const CLOUD_DISPATCH_MAX_AGE_MS = 2 * 60 * 1000
+// A local generation can legitimately run much longer than a queued cloud dispatch
+// (27B local models, cold caches). The dormant fallback voucher still expires so a
+// stale turn can never activate the cloud long after the fact.
+const LOCAL_FALLBACK_DISPATCH_MAX_AGE_MS = 30 * 60 * 1000
 const MAX_TRACKED_SESSIONS = 32
 const MAX_SANITIZED_MESSAGES_PER_SESSION = 128
 const AUTHORIZATION_SALT = randomBytes(16).toString('hex')
@@ -157,6 +161,14 @@ function requirePositiveInteger(value, label, fallback, maximum) {
   return resolved
 }
 
+function requireNonNegativeInteger(value, label, fallback, maximum) {
+  const resolved = value === undefined ? fallback : value
+  if (!Number.isSafeInteger(resolved) || resolved < 0 || resolved > maximum) {
+    throw new TypeError(`${label} must be an integer between 0 and ${maximum}`)
+  }
+  return resolved
+}
+
 function requireBoolean(value, label, fallback) {
   const resolved = value === undefined ? fallback : value
   if (typeof resolved !== 'boolean') throw new TypeError(`${label} must be a boolean`)
@@ -179,6 +191,9 @@ export function resolveConfig(input) {
   const known = new Set([
     'cloudProvider',
     'cloudModel',
+    'localProvider',
+    'localModel',
+    'routingMode',
     'trustedProviders',
     'trustedProviderPrefixes',
     'privacyPolicy',
@@ -196,6 +211,8 @@ export function resolveConfig(input) {
     'nerMaxTokens',
     'authorizationTtlMs',
     'cloudMaxTokens',
+    'localFailureCloudFallback',
+    'localFailureTimeoutMs',
     'recordSessionEvents',
   ])
   for (const key of Object.keys(config)) {
@@ -215,6 +232,13 @@ export function resolveConfig(input) {
     throw new TypeError('trustedProviders and trustedProviderPrefixes cannot both be empty')
   }
 
+  const routingMode = config.routingMode === undefined
+    ? 'privacy-gated-cloud'
+    : config.routingMode
+  if (routingMode !== 'privacy-gated-cloud' && routingMode !== 'user-choice') {
+    throw new TypeError('routingMode must be "privacy-gated-cloud" or "user-choice"')
+  }
+
   const privacyPolicy = requireString(config.privacyPolicy, 'privacyPolicy', DEFAULT_PRIVACY_POLICY)
   if (Buffer.byteLength(privacyPolicy) > 16_384) {
     throw new TypeError('privacyPolicy must be at most 16384 UTF-8 bytes')
@@ -225,9 +249,19 @@ export function resolveConfig(input) {
     ...requireStringArray(config.customSensitiveTerms, 'customSensitiveTerms'),
   ]
 
-  return Object.freeze({
+  const resolved = Object.freeze({
     cloudProvider: requireString(config.cloudProvider, 'cloudProvider', 'deepseek-official'),
     cloudModel: requireString(config.cloudModel, 'cloudModel', 'deepseek-v4-flash'),
+    // Explicit local landing used for NER/classification and hard privacy fallback when
+    // the user selects a cloud model. Empty by default: legacy behavior, where the
+    // main agent's selected trusted local provider remains the only supported setup.
+    localProvider: config.localProvider === undefined
+      ? undefined
+      : requireString(config.localProvider, 'localProvider'),
+    localModel: config.localModel === undefined
+      ? undefined
+      : requireString(config.localModel, 'localModel'),
+    routingMode,
     trustedProviders,
     trustedProviderPrefixes,
     privacyPolicy,
@@ -265,8 +299,33 @@ export function resolveConfig(input) {
       24 * 60 * 60 * 1000,
     ),
     cloudMaxTokens: requirePositiveInteger(config.cloudMaxTokens, 'cloudMaxTokens', 8_192, 65_536),
+    // Only turns already proven public may fall back; sensitive turns fail closed even
+    // if the local generation errors. The timeout measures time to the first content
+    // token; once any answer text has streamed, the turn is never retried on the cloud.
+    localFailureCloudFallback: requireBoolean(
+      config.localFailureCloudFallback,
+      'localFailureCloudFallback',
+      true,
+    ),
+    // 0 disables timeout-based fallback and keeps only immediate transport errors.
+    localFailureTimeoutMs: requireNonNegativeInteger(
+      config.localFailureTimeoutMs,
+      'localFailureTimeoutMs',
+      45_000,
+      10 * 60 * 1000,
+    ),
     recordSessionEvents: requireBoolean(config.recordSessionEvents, 'recordSessionEvents', false),
   })
+  if (resolved.routingMode === 'user-choice'
+    && (resolved.localProvider === undefined || resolved.localModel === undefined)) {
+    throw new TypeError('routingMode "user-choice" requires localProvider and localModel for privacy checks and forced local fallback')
+  }
+  const localLandingTrusted = resolved.trustedProviders.includes(resolved.localProvider)
+    || resolved.trustedProviderPrefixes.some(prefix => resolved.localProvider?.startsWith(prefix))
+  if (resolved.routingMode === 'user-choice' && !localLandingTrusted) {
+    throw new TypeError('routingMode "user-choice" requires localProvider/localModel to match trustedProviders or trustedProviderPrefixes')
+  }
+  return resolved
 }
 
 function hasTerm(text, term) {
@@ -604,9 +663,12 @@ function approvedAnchorMessageId(candidate) {
 // turn that merely happens to select the cloud provider and model.
 function dispatchIsCurrent(dispatch, options, now = Date.now()) {
   if (dispatch === undefined || options === undefined) return false
+  const maxAgeMs = dispatch.fallback === true
+    ? LOCAL_FALLBACK_DISPATCH_MAX_AGE_MS
+    : CLOUD_DISPATCH_MAX_AGE_MS
   if (!Number.isSafeInteger(dispatch.createdAt)
     || now < dispatch.createdAt
-    || now - dispatch.createdAt > CLOUD_DISPATCH_MAX_AGE_MS) {
+    || now - dispatch.createdAt > maxAgeMs) {
     return false
   }
   if (options.turn !== undefined && options.turn !== dispatch.turn) return false
@@ -1473,6 +1535,429 @@ export function apply(ctx, inputConfig) {
     agentCandidates.set(decisionKey(turn, step), candidate)
   }
 
+  // Activates the dormant cloud voucher after a local generation fails before its first
+  // content token. Every guard from the normal cloud path is repeated here: voucher
+  // identity, fresh phone/email authorization, validity window, and a final payload
+  // rescan. Failure of any guard yields an error stream; private data never reaches cloud.
+  const activateLocalFallbackCloud = async function* (options, dispatch, failure, userSignal) {
+    const sessionId = String(options.sessionId)
+    const candidate = dispatch.candidate
+    dispatch.state ??= { consumed: false }
+    // Single-use claim: there is no await between this identity check and the delete,
+    // so two concurrent failing local streams can never both activate a cloud request.
+    if (cloudDispatches.get(sessionId) !== dispatch) {
+      yield* errorStream(
+        'PRIVACY_ROUTER_STALE_DISPATCH',
+        'privacy-router: the local failure fallback voucher is no longer current',
+      )
+      return
+    }
+    cloudDispatches.delete(sessionId)
+    dispatch.state.consumed = true
+    if (!dispatchIsCurrent(dispatch, options)) {
+      yield* errorStream(
+        'PRIVACY_ROUTER_STALE_DISPATCH',
+        'privacy-router: the local failure fallback voucher is expired or no longer matches this request',
+      )
+      return
+    }
+    const aborted = () => userSignal?.aborted === true
+    if (aborted()) return
+    let authorization = dispatch.authorization
+    const deferred = dispatch.deferredEntities ?? []
+    if (deferred.length > 0) {
+      const answer = await requestEntityAuthorization(
+        dispatch.agent,
+        deferred,
+        // The local leg's signal is aborted by the time we get here; the authorization
+        // card must follow the fallback request's independent signal instead.
+        userSignal ?? options.signal,
+      )
+      if (!answer.ok) {
+        appendEvent(dispatch.session, 'privacy-router/cloud-blocked', {
+          checkId: dispatch.checkId,
+          turn: dispatch.turn,
+          step: dispatch.step,
+          reason: answer.reason ?? 'authorization-denied',
+          fallback: true,
+        })
+        yield* errorStream(
+          'PRIVACY_ROUTER_FALLBACK_AUTHORIZATION_DENIED',
+          'privacy-router: local model failed and placeholder cloud fallback was not authorized',
+        )
+        return
+      }
+      if (!entityAuthorizationSatisfied(dispatch.agent, deferred, answer)) {
+        appendEvent(dispatch.session, 'privacy-router/cloud-blocked', {
+          checkId: dispatch.checkId,
+          turn: dispatch.turn,
+          step: dispatch.step,
+          reason: 'authorization-value-mismatch',
+          fallback: true,
+        })
+        yield* errorStream(
+          'PRIVACY_ROUTER_FALLBACK_AUTHORIZATION_DENIED',
+          'privacy-router: the fallback authorization does not match the detected entities',
+        )
+        return
+      }
+      authorization = combineCloudAuthorization(answer, dispatch.candidate.historyAuthorization)
+      if (answer.scope === 'session-category') {
+        // Match the normal cloud path: keep the sanitized copy so later turns can rebuild
+        // cloud history under the session-category grant. One-time grants stay uncached.
+        rememberSanitizedMessages(sessionId, candidate.messages)
+      }
+      if (aborted()) {
+        appendEvent(dispatch.session, 'privacy-router/cloud-blocked', {
+          checkId: dispatch.checkId,
+          turn: dispatch.turn,
+          step: dispatch.step,
+          reason: 'aborted',
+          fallback: true,
+        })
+        return
+      }
+    } else if (dispatch.candidate.historyAuthorization !== undefined) {
+      authorization = combineCloudAuthorization(
+        authorization ?? { ok: true, scope: 'none', types: [] },
+        dispatch.candidate.historyAuthorization,
+      )
+    }
+    // While the authorization card was pending, a newer turn may have claimed the
+    // session's dispatch slot. Never overwrite it, and re-check the voucher window.
+    if (cloudDispatches.get(sessionId) !== undefined || !dispatchIsCurrent(dispatch, options)) {
+      yield* errorStream(
+        'PRIVACY_ROUTER_STALE_DISPATCH',
+        'privacy-router: the local failure fallback voucher was superseded or expired during authorization',
+      )
+      return
+    }
+    if (aborted()) return
+    if (!dispatchAuthorizationValid(authorization)) {
+      appendEvent(dispatch.session, 'privacy-router/cloud-blocked', {
+        checkId: dispatch.checkId,
+        turn: dispatch.turn,
+        step: dispatch.step,
+        reason: 'authorization-expired',
+        fallback: true,
+      })
+      yield* errorStream(
+        'PRIVACY_ROUTER_AUTHORIZATION_EXPIRED',
+        'privacy-router: placeholder authorization expired before cloud fallback',
+      )
+      return
+    }
+    const sentMessages = [...candidate.cloudMessages, ...candidate.messages]
+    const finalRescanReason = rescanCloudPayload(
+      sentMessages,
+      CLOUD_SYSTEM_PROMPT,
+      config,
+      candidate.entities ?? [],
+    )
+    if (finalRescanReason !== undefined) {
+      appendEvent(dispatch.session, 'privacy-router/cloud-blocked', {
+        checkId: dispatch.checkId,
+        turn: dispatch.turn,
+        step: dispatch.step,
+        reason: finalRescanReason,
+        fallback: true,
+      })
+      yield* errorStream(
+        'PRIVACY_ROUTER_CLOUD_RESCAN_BLOCKED',
+        'privacy-router: final cloud privacy rescan blocked the fallback request',
+      )
+      return
+    }
+    // Last-chance guards: user cancellation or a newer turn must prevent the cloud send.
+    if (aborted() || cloudDispatches.get(sessionId) !== undefined) {
+      if (cloudDispatches.get(sessionId) !== undefined) {
+        yield* errorStream(
+          'PRIVACY_ROUTER_STALE_DISPATCH',
+          'privacy-router: a newer request superseded the local failure fallback voucher',
+        )
+      }
+      return
+    }
+    if (aborted()) return
+    const failureReason = String(failure?.code ?? failure?.name ?? 'local-error')
+    // The decision event for this turn was 'local'. Record the actual cloud dispatch in
+    // the same shape approvedCloudMessageGrants() consumes, so a session-category grant
+    // legitimately covers this user message on later turns; once-value grants stay
+    // single-use because that function skips them.
+    appendEvent(dispatch.session, 'privacy-router/check-result', {
+      checkId: dispatch.checkId,
+      turn: dispatch.turn,
+      step: dispatch.step,
+      decision: 'cloud',
+      classification: 'public',
+      method: 'local-failure-fallback',
+      provider: config.cloudProvider,
+      model: config.cloudModel,
+      evaluatedMessageIds: candidate.messages.map(message => String(message.id)),
+      approvedMessageIds: candidate.messages.map(message => String(message.id)),
+      authorization: publicAuthorization(authorization),
+      placeholderCount: candidate.placeholderCount ?? 0,
+      fallback: true,
+    })
+    appendEvent(dispatch.session, 'privacy-router/local-fallback', {
+      checkId: dispatch.checkId,
+      turn: dispatch.turn,
+      step: dispatch.step,
+      reason: failureReason,
+      fallback: 'cloud',
+    })
+    appendEvent(dispatch.session, 'privacy-router/cloud-dispatch', {
+      checkId: dispatch.checkId,
+      turn: dispatch.turn,
+      step: dispatch.step,
+      sentMessages: sentMessages.map(message => ({
+        messageId: String(message.id),
+        role: message.role,
+      })),
+      withheldMessages: candidate.context.messages
+        .filter(message => !message.cloudSafe)
+        .map(message => ({
+          messageId: message.id,
+          role: message.role,
+        })),
+      contextTruncated: candidate.context.truncated,
+      toolsIncluded: false,
+      placeholderCount: candidate.placeholderCount ?? 0,
+      authorization: publicAuthorization(authorization),
+      rescan: 'passed',
+      fallback: true,
+    })
+    const request = {
+      provider: config.cloudProvider,
+      model: config.cloudModel,
+      messages: sentMessages,
+      system: CLOUD_SYSTEM_PROMPT,
+      tools: [],
+      maxTokens: config.cloudMaxTokens,
+      signal: userSignal ?? options.signal,
+    }
+    internalRequests.add(request)
+    try {
+      yield* cloudStream(ctx.llm.stream(request))
+    } catch (error) {
+      yield* errorStream(
+        'PRIVACY_ROUTER_FALLBACK_CLOUD_FAILED',
+        'privacy-router: local model failed and cloud fallback also failed: '
+          + (error instanceof Error ? error.message : String(error)),
+      )
+    }
+  }
+
+  // Watches a trusted local generation. A transport error, an error finish before any
+  // content, or a first-content-token timeout activates the dormant cloud voucher. The
+  // timeout is one fixed deadline from stream start, so a trickle of non-content chunks
+  // cannot postpone it. Once real content (or reasoning) has streamed, the voucher is
+  // consumed and later errors pass through unchanged, so one question can never receive
+  // two spliced model answers.
+  const localStreamWithFallback = (options, next, dispatch) => {
+    const sessionId = String(options.sessionId)
+    return (async function* () {
+      const parentSignal = options.signal
+      // The cloud fallback gets its own signal: canceling a wedged local leg must not
+      // cancel the fallback request that replaces it. The local leg gets its own signal
+      // so a first-token timeout can cancel its upstream while the fallback proceeds.
+      const fallbackController = new AbortController()
+      const localController = new AbortController()
+      const onParentAbort = () => {
+        fallbackController.abort()
+        localController.abort()
+      }
+      if (parentSignal?.aborted) {
+        fallbackController.abort()
+        localController.abort()
+      }
+      parentSignal?.addEventListener?.('abort', onParentAbort, { once: true })
+      options.signal = localController.signal
+      const parentAborted = () => parentSignal?.aborted === true
+
+      let iterator
+      const abortListenerCleanups = []
+      // Best-effort upstream cancellation; never awaited (a wedged stream may never settle).
+      const cancelIterator = (stream) => {
+        localController.abort()
+        try {
+          const cancelled = iterator?.return?.()
+          if (cancelled?.catch) cancelled.catch(() => {})
+        } catch {
+          // The iterator is already finished or does not support cancellation.
+        }
+        try {
+          stream?.cancel?.()
+        } catch {
+          // Not a cancellable stream object.
+        }
+      }
+
+      const abortError = () => {
+        const error = new Error('privacy-router: local request aborted')
+        error.code = 'ABORT_ERR'
+        return error
+      }
+      // Races a pending operation against parent cancellation so a non-cooperative
+      // upstream cannot hold this wrapper alive after the user aborts. The operation
+      // is a thunk so it is never started when the parent is already aborted (which
+      // would otherwise leave an unconsumed rejected promise).
+      const raceAbort = (start, stream) => {
+        let onAbort
+        const promise = new Promise((resolve, reject) => {
+        if (parentAborted()) {
+          cancelIterator(stream)
+          reject(abortError())
+          return
+        }
+        let settled = false
+        onAbort = () => {
+          if (settled) return
+          settled = true
+          cancelIterator(stream)
+          reject(abortError())
+        }
+        parentSignal?.addEventListener?.('abort', onAbort, { once: true })
+        Promise.resolve().then(start).then(
+          value => {
+            parentSignal?.removeEventListener?.('abort', onAbort)
+            if (!settled) {
+              settled = true
+              resolve(value)
+            }
+          },
+          error => {
+            parentSignal?.removeEventListener?.('abort', onAbort)
+            if (!settled) {
+              settled = true
+              reject(error)
+            }
+          },
+        )
+        })
+        // Allows the outer finally to detach the abort listener even when the pending
+        // operation never settles (e.g. timeout won but the iterator is wedged).
+        abortListenerCleanups.push(() => parentSignal?.removeEventListener?.('abort', onAbort))
+        return promise
+      }
+
+      let stream
+      try {
+        stream = await raceAbort(next)
+      } catch (error) {
+        if (parentAborted()) return
+        yield* activateLocalFallbackCloud(options, dispatch, error, fallbackController.signal)
+        return
+      }
+      iterator = stream[Symbol.asyncIterator]()
+      let contentStarted = false
+      // One fixed deadline from the moment streaming starts; each next() races only
+      // the remaining time, so non-content chunks cannot extend the window.
+      const deadline = config.localFailureTimeoutMs > 0
+        ? Date.now() + config.localFailureTimeoutMs
+        : undefined
+      let timer
+      const clearTimer = () => {
+        if (timer !== undefined) {
+          clearTimeout(timer)
+          timer = undefined
+        }
+      }
+      const nextChunk = async () => {
+        if (contentStarted || deadline === undefined) return raceAbort(() => iterator.next(), stream)
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+          const error = new Error('privacy-router: local first-token timeout')
+          error.code = 'PRIVACY_ROUTER_LOCAL_TIMEOUT'
+          throw error
+        }
+        let settled = false
+        return new Promise((resolve, reject) => {
+          timer = setTimeout(() => {
+            if (settled) return
+            settled = true
+            const error = new Error('privacy-router: local first-token timeout')
+            error.code = 'PRIVACY_ROUTER_LOCAL_TIMEOUT'
+            reject(error)
+          }, remaining)
+          raceAbort(() => iterator.next(), stream).then(
+            value => {
+              if (!settled) {
+                settled = true
+                resolve(value)
+              }
+            },
+            error => {
+              if (!settled) {
+                settled = true
+                reject(error)
+              }
+            },
+          )
+        })
+      }
+      try {
+        while (true) {
+          let result
+          try {
+            result = await nextChunk()
+          } catch (error) {
+            clearTimer()
+            if (parentAborted()) return
+            if (!contentStarted) {
+              cancelIterator(stream)
+              yield* activateLocalFallbackCloud(
+                options,
+                dispatch,
+                error,
+                fallbackController.signal,
+              )
+              return
+            }
+            throw error
+          }
+          clearTimer()
+          if (result.done) return
+          const chunk = result.value
+          if (chunk?.type === 'finish'
+            && chunk.reason?.kind === 'error'
+            && !contentStarted) {
+            cancelIterator(stream)
+            if (!parentAborted()) {
+              yield* activateLocalFallbackCloud(
+                options,
+                dispatch,
+                new Error(chunk.reason.failure?.message ?? 'local stream error finish'),
+                fallbackController.signal,
+              )
+            }
+            return
+          }
+          const carriesContent = (chunk?.type === 'text-delta'
+              || chunk?.type === 'reasoning-delta')
+            && typeof chunk.text === 'string'
+            && chunk.text.length > 0
+          if (!contentStarted && carriesContent) {
+            contentStarted = true
+            // The local model is answering; mark the voucher consumed at the decision
+            // level too, so a repeated agent/request can never resurrect it.
+            dispatch.state.consumed = true
+            if (cloudDispatches.get(sessionId) === dispatch) cloudDispatches.delete(sessionId)
+          }
+          yield chunk
+        }
+      } finally {
+        clearTimer()
+        parentSignal?.removeEventListener?.('abort', onParentAbort)
+        while (abortListenerCleanups.length > 0) abortListenerCleanups.pop()()
+        // Consumer cancellation (break/return/throw), normal end, or abort: release the
+        // local upstream promptly and never leave a pending iterator or abort listener.
+        if (!contentStarted) cancelIterator(stream)
+        else localController.abort()
+      }
+    })()
+  }
+
   const takeCandidate = (agent, turn, step) => {
     const agentCandidates = candidates.get(agent)
     const key = decisionKey(turn, step)
@@ -1504,10 +1989,28 @@ export function apply(ctx, inputConfig) {
 
   ctx.on('agent/request', async (payload, next) => {
     const proposed = await next()
+    const proposedTrusted = isTrustedRoute(proposed, config)
     const proposedLocal = rememberLocalRoute(payload.agent, proposed)
     const local = proposedLocal ?? currentLocalRoute(payload.agent)
-    if (local === undefined) {
-      throw new Error('privacy-router: the main agent must use a trusted local provider')
+    const prefersCloud = !proposedTrusted
+    // In user-choice mode NER/classification and forced local fallback always run on
+    // the explicitly configured landing, even if an older trusted route was remembered
+    // from a previously selected provider. Legacy mode keeps using the selected route.
+    const configuredLocalLanding = config.routingMode === 'user-choice'
+      ? callConfig({ provider: config.localProvider, model: config.localModel })
+      : undefined
+    const localLanding = configuredLocalLanding ?? local
+    if (localLanding === undefined) {
+      throw new Error(prefersCloud
+        ? 'privacy-router: a cloud model is selected but no trusted local provider is available for privacy checks; select a local provider or configure localProvider/localModel'
+        : 'privacy-router: the main agent must use a trusted local provider')
+    }
+    if (config.routingMode === 'user-choice'
+      && payload.agent?.session?.id !== undefined
+      && payload.agent.session.id !== null) {
+      // Known auxiliary purposes (session title, compaction) always inherit this local
+      // landing, including while the user has a cloud model selected.
+      rememberSessionKey(trustedRoutesBySession, String(payload.agent.session.id), localLanding)
     }
 
     const prior = decisions.get(payload.agent)
@@ -1524,6 +2027,20 @@ export function apply(ctx, inputConfig) {
           createdAt: Date.now(),
           approvedMessageId: approvedAnchorMessageId(prior.candidate),
         })
+      } else if (prior.fallback !== undefined) {
+        if (prior.fallback.state?.consumed === true) {
+          cloudDispatches.delete(sessionId)
+        } else {
+          rememberSessionKey(cloudDispatches, sessionId, {
+            ...prior.fallback,
+            fallback: true,
+            session: payload.agent.session,
+            agent: payload.agent,
+            // Anchor the age window to the original decision; a provider retry must
+            // not extend the 30-minute lifetime.
+            createdAt: prior.fallback.createdAt ?? Date.now(),
+          })
+        }
       } else {
         cloudDispatches.delete(sessionId)
       }
@@ -1546,6 +2063,7 @@ export function apply(ctx, inputConfig) {
     let entityAnalysis
     let authorization
     let cloudCandidate
+    let deferredEntities = []
     let preflightRescanReason
     let historyEntities = []
     if (candidate !== undefined) {
@@ -1559,7 +2077,7 @@ export function apply(ctx, inputConfig) {
               ctx,
               config,
               candidate.text,
-              local,
+              localLanding,
               payload.signal,
               internalRequests,
             )
@@ -1611,7 +2129,7 @@ export function apply(ctx, inputConfig) {
                 ctx,
                 config,
                 candidate,
-                local,
+                localLanding,
                 payload.signal,
                 internalRequests,
               )
@@ -1648,14 +2166,23 @@ export function apply(ctx, inputConfig) {
 
     if (classification === 'public' && candidate !== undefined && entityAnalysis !== undefined) {
       const eligibleEntities = entityAnalysis.eligible ?? []
-      authorization = eligibleEntities.length === 0
-        ? { ok: true, scope: 'none', types: [] }
-        : await requestEntityAuthorization(payload.agent, eligibleEntities, payload.signal)
-      if (!authorization.ok) {
+      const honorLocalPreference = config.routingMode === 'user-choice' && !prefersCloud
+      // When the user explicitly chose local and the turn is public, the local model answers
+      // first. A phone/email authorization card only appears if local generation fails and
+      // the dormant fallback voucher activates; placeholder payload validation still runs
+      // now so the fallback path only needs the user's decision at failure time.
+      const deferAuthorization = honorLocalPreference && eligibleEntities.length > 0
+      if (eligibleEntities.length === 0) {
+        authorization = { ok: true, scope: 'none', types: [] }
+      } else if (!deferAuthorization) {
+        authorization = await requestEntityAuthorization(payload.agent, eligibleEntities, payload.signal)
+      }
+      if (authorization !== undefined && !authorization.ok) {
         classification = 'unknown'
         method = 'authorization'
         reason = authorization.reason ?? 'authorization-denied'
-      } else if (!entityAuthorizationSatisfied(payload.agent, eligibleEntities, authorization)) {
+      } else if (authorization !== undefined
+        && !entityAuthorizationSatisfied(payload.agent, eligibleEntities, authorization)) {
         classification = 'unknown'
         method = 'authorization'
         reason = 'authorization-value-mismatch'
@@ -1682,7 +2209,7 @@ export function apply(ctx, inputConfig) {
             config,
             candidate,
             plannedMessages,
-            local,
+            localLanding,
             payload.signal,
             internalRequests,
           )
@@ -1698,13 +2225,15 @@ export function apply(ctx, inputConfig) {
           // A one-time value grant is deliberately never reusable by a later turn, so its
           // sanitized copy is not cached at all. Caching it would only retain a redacted
           // message that approvedCloudMessageGrants() would refuse to hand back anyway.
-          if (authorization?.scope !== 'once-value') {
+          if (!deferAuthorization && authorization?.scope !== 'once-value') {
             rememberSanitizedMessages(
               String(payload.agent.session.id),
               sanitizedMessages,
             )
           }
-          const cloudAuthorization = combineCloudAuthorization(authorization, candidate.historyAuthorization)
+          const cloudAuthorization = deferAuthorization
+            ? undefined
+            : combineCloudAuthorization(authorization, candidate.historyAuthorization)
           cloudCandidate = {
             ...candidate,
             messages: sanitizedMessages,
@@ -1712,21 +2241,39 @@ export function apply(ctx, inputConfig) {
             // In-memory only, so the final rescan can also guard rebuilt history.
             // The session event receives type/count metadata instead, never values.
             entities: [...entityAnalysis.entities, ...historyEntities],
-            authorization: cloudAuthorization,
+            ...(cloudAuthorization === undefined ? {} : { authorization: cloudAuthorization }),
           }
+          deferredEntities = deferAuthorization ? eligibleEntities : []
         }
       }
     }
 
-    const useCloud = classification === 'public' && cloudCandidate !== undefined
+    const userSelectedCloud = config.routingMode !== 'user-choice' || prefersCloud
+    const useCloud = userSelectedCloud
+      && classification === 'public'
+      && cloudCandidate !== undefined
+      && cloudCandidate.authorization !== undefined
     const cloudAuthorization = useCloud ? cloudCandidate.authorization : undefined
+    // A proven-public local turn keeps a dormant cloud voucher. It activates only if the
+    // local generation fails before its first content token. Sensitive/unknown turns get
+    // no voucher, so a local failure can never push private data to the cloud.
+    const fallbackCandidate = !useCloud
+      && config.routingMode === 'user-choice'
+      && !prefersCloud
+      && config.localFailureCloudFallback
+      && classification === 'public'
+      && cloudCandidate !== undefined
+      ? cloudCandidate
+      : undefined
+    const fallbackState = { consumed: false }
+    const fallbackCreatedAt = Date.now()
     const route = useCloud
       ? {
         provider: config.cloudProvider,
         model: config.cloudModel,
         maxTokens: config.cloudMaxTokens,
       }
-      : local
+      : (proposedTrusted ? (local ?? localLanding) : localLanding)
     appendEvent(payload.agent.session, 'privacy-router/check-result', {
       checkId,
       turn: payload.turn,
@@ -1755,6 +2302,17 @@ export function apply(ctx, inputConfig) {
       ...(cloudAuthorization === undefined
         ? {}
         : { authorization: publicAuthorization(cloudAuthorization) }),
+      ...(config.routingMode === 'user-choice'
+        ? { userPreference: prefersCloud ? 'cloud' : 'local' }
+        : {}),
+      ...(fallbackCandidate === undefined
+        ? {}
+        : {
+          localFailureCloudFallback: 'ready',
+          ...(deferredEntities.length === 0
+            ? {}
+            : { fallbackRequiresAuthorization: publicEntityMetadata(deferredEntities) }),
+        }),
       ...(cloudCandidate === undefined ? {} : { placeholderCount: cloudCandidate.placeholderCount }),
       ...(preflightRescanReason === undefined
         ? {}
@@ -1772,6 +2330,22 @@ export function apply(ctx, inputConfig) {
       turn: payload.turn,
       useCloud,
       ...(cloudAuthorization === undefined ? {} : { authorization: cloudAuthorization }),
+      ...(fallbackCandidate === undefined
+        ? {}
+        : {
+          fallback: {
+            candidate: fallbackCandidate,
+            checkId,
+            session: payload.agent.session,
+            agent: payload.agent,
+            step: payload.step,
+            turn: payload.turn,
+            deferredEntities,
+            state: fallbackState,
+            createdAt: fallbackCreatedAt,
+            approvedMessageId: approvedAnchorMessageId(fallbackCandidate),
+          },
+        }),
     })
 
     const sessionId = String(payload.agent.session.id)
@@ -1785,6 +2359,25 @@ export function apply(ctx, inputConfig) {
         turn: payload.turn,
         createdAt: Date.now(),
         approvedMessageId: approvedAnchorMessageId(cloudCandidate),
+      })
+      return route
+    }
+
+    if (fallbackCandidate !== undefined) {
+      rememberSessionKey(cloudDispatches, sessionId, {
+        candidate: fallbackCandidate,
+        checkId,
+        // undefined for deferred phone/email authorization; validated at activation.
+        authorization: fallbackCandidate.authorization,
+        fallback: true,
+        state: fallbackState,
+        session: payload.agent.session,
+        agent: payload.agent,
+        step: payload.step,
+        turn: payload.turn,
+        deferredEntities,
+        createdAt: fallbackCreatedAt,
+        approvedMessageId: approvedAnchorMessageId(fallbackCandidate),
       })
       return route
     }
@@ -1834,6 +2427,21 @@ export function apply(ctx, inputConfig) {
       && options.provider === config.cloudProvider
       && options.model === config.cloudModel) {
       cloudDispatches.delete(sessionId)
+      if (dispatch.fallback === true) {
+        // The local leg has not failed yet, so a cloud request matching this session
+        // would bypass the user's local selection. Dormant vouchers can only be
+        // consumed by activateLocalFallbackCloud(), which issues an internal request.
+        appendEvent(dispatch.session, 'privacy-router/cloud-blocked', {
+          checkId: dispatch.checkId,
+          turn: dispatch.turn,
+          step: dispatch.step,
+          reason: 'dormant-fallback-rejected',
+        })
+        return errorStream(
+          'PRIVACY_ROUTER_DORMANT_FALLBACK_REJECTED',
+          'privacy-router: the local failure fallback voucher cannot be used before the local request fails',
+        )
+      }
       if (!dispatchIsCurrent(dispatch, options)) {
         appendEvent(dispatch.session, 'privacy-router/cloud-blocked', {
           checkId: dispatch.checkId,
@@ -1911,8 +2519,20 @@ export function apply(ctx, inputConfig) {
       return cloudStream(ctx.llm.stream(request))
     }
 
+    if (isTrustedRoute(options, config)) {
+      const fallbackDispatch = cloudDispatches.get(sessionId)
+      if (fallbackDispatch?.fallback === true) {
+        if (!dispatchIsCurrent(fallbackDispatch, options)) {
+          // The voucher belongs to another turn/message. Drop it, but never block the
+          // legitimate local answer the user explicitly selected.
+          cloudDispatches.delete(sessionId)
+          return next()
+        }
+        return localStreamWithFallback(options, next, fallbackDispatch)
+      }
+      return next()
+    }
     cloudDispatches.delete(sessionId)
-    if (isTrustedRoute(options, config)) return next()
     return errorStream(
       'PRIVACY_ROUTER_UNTRUSTED_MAIN_PROVIDER',
       'privacy-router: direct main-agent cloud requests are blocked; select a trusted local provider',
