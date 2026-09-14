@@ -6,7 +6,21 @@
         cloudModel: !!js process.env.PRIVACY_ROUTER_CLOUD_MODEL || 'deepseek-v4-flash'
         trustedProviderPrefixes:
           - local-ai-
+        sensitiveTerms: !!js "process.env.PRIVACY_ROUTER_SENSITIVE_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_SENSITIVE_TERMS_JSON) : undefined"
+        customSensitiveTerms: !!js "process.env.PRIVACY_ROUTER_CUSTOM_SENSITIVE_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_CUSTOM_SENSITIVE_TERMS_JSON) : undefined"
+        internalOrgTerms: !!js "process.env.PRIVACY_ROUTER_INTERNAL_ORG_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_INTERNAL_ORG_TERMS_JSON) : undefined"
+        customerOrgTerms: !!js "process.env.PRIVACY_ROUTER_CUSTOMER_ORG_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_CUSTOMER_ORG_TERMS_JSON) : undefined"
+        supplierOrgTerms: !!js "process.env.PRIVACY_ROUTER_SUPPLIER_ORG_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_SUPPLIER_ORG_TERMS_JSON) : undefined"
+        sensitiveJobTitleTerms: !!js "process.env.PRIVACY_ROUTER_SENSITIVE_JOB_TITLE_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_SENSITIVE_JOB_TITLE_TERMS_JSON) : undefined"
+        projectTerms: !!js "process.env.PRIVACY_ROUTER_PROJECT_TERMS_JSON ? JSON.parse(process.env.PRIVACY_ROUTER_PROJECT_TERMS_JSON) : undefined"
+        classifierMaxTokens: !!js Number(process.env.PRIVACY_ROUTER_CLASSIFIER_MAX_TOKENS || '512')
+        nerConfidenceThreshold: !!js Number(process.env.PRIVACY_ROUTER_NER_CONFIDENCE_THRESHOLD || '0.85')
+        nerMaxTokens: !!js Number(process.env.PRIVACY_ROUTER_NER_MAX_TOKENS || '512')
+        authorizationTtlMs: !!js Number(process.env.PRIVACY_ROUTER_AUTHORIZATION_TTL_MS || '43200000')
         privacyPolicy: >-
-          Treat personal data, credentials, local paths, unpublished source code,
-          internal project details, and confidential business information as sensitive.
+          Treat identity cards, bank cards, credentials, secrets, local paths,
+          names, precise addresses, unpublished source code, internal project details,
+          internal/customer/supplier organizations, and confidential business information
+          as sensitive. Phone numbers and email addresses may use placeholders only after
+          explicit authorization, and the complete request must remain safe and self-contained.
         recordSessionEvents: !!js process.env.PRIVACY_ROUTER_SESSION_EVENTS === '1'
